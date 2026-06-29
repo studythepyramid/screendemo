@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Vim / Neovim swap files
+*.swp
+*.swo
+.*.swp
+.*.swo
+*~
+
+# Local scratch / recordings during dev
+tmp/

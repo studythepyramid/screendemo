@@ -1,0 +1,21 @@
+[project]
+name = "screendemo"
+version = "0.1.0"
+description = "Screen recording, camera, and classroom demo for GNOME Wayland"
+readme = "design.md"
+authors = [
+    { name = "za", email = "studythepyramid@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "dbus-python>=1.4.0",
+    "opencv-python>=4.13.0.92",
+    "pygobject>=3.56.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = false
