@@ -1,5 +1,5 @@
 """
-Small GTK control panel for screendemo screen recording (v1, video only).
+Small GTK control panel for screendemo (A+V screen recording + snapshot).
 
 Recording runs in-process (shared GLib loop with Gtk) so Stop works reliably.
 
@@ -22,14 +22,17 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk
 
-from py.screen_recording import GnomeShellScreenRecorder, PortalScreenRecorder
+from py.screen_recording import GnomeShellAvRecorder
+from py.snapshot import capture_snapshot_async
+from py.xdgav import PortalAvRecorder
 from py.settings import (
     DEFAULT_RECORDING_MODE,
     PROJECT_ROOT,
     RECORDING_MODE_GNOME,
     RECORDING_MODE_PORTAL,
     TMP_FOLDER,
-    ScreenRecordingSettings,
+    AvRecordingSettings,
+    DELAY_FOR_ACTION,
     timestamped_filename,
 )
 
@@ -42,8 +45,9 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
         self.set_title("screendemo")
         self.set_default_size(440, 300)
 
-        self._recorder: PortalScreenRecorder | GnomeShellScreenRecorder | None = None
+        self._recorder: PortalAvRecorder | GnomeShellAvRecorder | None = None
         self._last_saved_path: str | None = None
+        self._snapshot_busy = False
 
         self.connect("close-request", self._on_close_request)
 
@@ -76,7 +80,7 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
         name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         name_row.append(Gtk.Label(label="Filename:", width_chars=8, xalign=0))
         self.filename_entry = Gtk.Entry()
-        default_ext = "mp4"
+        default_ext = "mkv" if DEFAULT_RECORDING_MODE == RECORDING_MODE_GNOME else "mp4"
         self.filename_entry.set_text(timestamped_filename("recording", default_ext))
         self.filename_entry.set_hexpand(True)
         name_row.append(self.filename_entry)
@@ -86,7 +90,10 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         mode_row.append(Gtk.Label(label="Mode:", width_chars=8, xalign=0))
         self.mode_dropdown = Gtk.DropDown.new_from_strings(
-            ["GNOME Shell (no dialog → MP4)", "Portal (picker → MP4)"]
+            [
+                "GNOME Shell (no dialog → MKV + audio)",
+                "Portal (picker → MP4 + audio)",
+            ]
         )
         self.mode_dropdown.set_selected(
             0 if DEFAULT_RECORDING_MODE == RECORDING_MODE_GNOME else 1
@@ -108,6 +115,9 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
         self.btn_stop.set_sensitive(False)
         self.btn_stop.connect("clicked", self._on_stop)
         btn_row.append(self.btn_stop)
+        self.btn_snapshot = Gtk.Button(label="Snapshot")
+        self.btn_snapshot.connect("clicked", self._on_snapshot)
+        btn_row.append(self.btn_snapshot)
         root.append(btn_row)
 
         self.status_label = Gtk.Label(label="Status: idle", xalign=0)
@@ -115,10 +125,10 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
 
         hint = Gtk.Label(
             label=(
-                "Portal mode shows GNOME's screen-share icon in the top bar "
-                "(required by the system; use GNOME Shell mode to avoid it). "
-                "Close this window with the ✕ button when done — the terminal "
-                "stays busy while the UI is open."
+                "Record captures mic + desktop audio. "
+                "Portal mode shows GNOME's screen-share icon in the top bar; "
+                "GNOME Shell mode avoids the picker. "
+                "Close this window with the ✕ button when done."
             ),
             wrap=True,
             xalign=0,
@@ -141,7 +151,7 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
         )
 
     def _default_ext_for_mode(self) -> str:
-        return "mp4"
+        return "mkv" if self._recording_mode() == RECORDING_MODE_GNOME else "mp4"
 
     def _on_mode_changed(self, _dropdown, _pspec) -> None:
         name = self.filename_entry.get_text().strip()
@@ -150,12 +160,16 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
         stem = Path(name).stem
         self.filename_entry.set_text(f"{stem}.{self._default_ext_for_mode()}")
 
-    def _resolve_output_path(self) -> Path:
+    def _resolve_output_folder(self) -> Path:
         folder_text = self.folder_entry.get_text().strip() or "tmp"
         folder = Path(folder_text)
         if not folder.is_absolute():
             folder = PROJECT_ROOT / folder
         folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _resolve_output_path(self) -> Path:
+        folder = self._resolve_output_folder()
 
         filename = self.filename_entry.get_text().strip()
         if not filename:
@@ -165,11 +179,22 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
         return folder / filename
 
     def _set_recording_ui(self, active: bool) -> None:
-        self.btn_record.set_sensitive(not active)
+        self.btn_record.set_sensitive(not active and not self._snapshot_busy)
         self.btn_stop.set_sensitive(active)
-        self.folder_entry.set_sensitive(not active)
-        self.filename_entry.set_sensitive(not active)
-        self.mode_dropdown.set_sensitive(not active)
+        self.btn_snapshot.set_sensitive(not self._snapshot_busy)
+        self.folder_entry.set_sensitive(not active and not self._snapshot_busy)
+        self.filename_entry.set_sensitive(not active and not self._snapshot_busy)
+        self.mode_dropdown.set_sensitive(not active and not self._snapshot_busy)
+
+    def _set_snapshot_ui(self, active: bool) -> None:
+        self._snapshot_busy = active
+        recording = self._recorder is not None
+        self.btn_record.set_sensitive(not active and not recording)
+        self.btn_stop.set_sensitive(recording)
+        self.btn_snapshot.set_sensitive(not active)
+        self.folder_entry.set_sensitive(not active and not recording)
+        self.filename_entry.set_sensitive(not active and not recording)
+        self.mode_dropdown.set_sensitive(not active and not recording)
 
     def _set_status(self, text: str) -> None:
         self.status_label.set_label(f"Status: {text}")
@@ -202,7 +227,7 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
 
         output_path = self._resolve_output_path()
         mode = self._recording_mode()
-        settings = ScreenRecordingSettings(output_path=str(output_path), mode=mode)
+        settings = AvRecordingSettings(output_path=str(output_path), mode=mode)
         try:
             settings.validate()
         except ValueError as exc:
@@ -210,9 +235,9 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
             return
 
         if mode == RECORDING_MODE_GNOME:
-            self._recorder = GnomeShellScreenRecorder(settings)
+            self._recorder = GnomeShellAvRecorder(settings)
         else:
-            self._recorder = PortalScreenRecorder(settings)
+            self._recorder = PortalAvRecorder(settings)
 
         self._set_recording_ui(True)
         self._recorder.begin(on_finished=self._on_recording_finished)
@@ -232,6 +257,34 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
         self._set_status("stopping…")
         self._recorder.request_stop()
 
+    def _on_snapshot(self, _button) -> None:
+        if self._snapshot_busy:
+            return
+
+        output_path = self._resolve_output_folder() / timestamped_filename(
+            "snapshot", "png"
+        )
+        self._set_snapshot_ui(True)
+        self._set_status(
+            f"snapshot in {DELAY_FOR_ACTION}s… hide this window"
+        )
+
+        def on_done(path: str) -> None:
+            saved = Path(path)
+            self._set_snapshot_ui(False)
+            self._set_status(f"idle — saved {saved.name}")
+
+        def on_error(message: str) -> None:
+            self._set_snapshot_ui(False)
+            self._set_status(f"error — {message}")
+
+        def _start_capture() -> bool:
+            self._set_status(f"snapshot → {output_path.name}")
+            capture_snapshot_async(output_path, on_done, on_error=on_error)
+            return GLib.SOURCE_REMOVE
+
+        GLib.timeout_add_seconds(DELAY_FOR_ACTION, _start_capture)
+
     def _on_recording_finished(self, exit_code: int) -> None:
         GLib.idle_add(self._finish_recording_ui, exit_code)
 
@@ -240,18 +293,23 @@ class SimpleRecorderWindow(Adw.ApplicationWindow):
             self._last_saved_path = getattr(self._recorder, "output_path", None)
         self._recorder = None
         self._set_recording_ui(False)
+        ext = self._default_ext_for_mode()
         if exit_code == 0 and self._last_saved_path:
             saved = Path(self._last_saved_path)
-            self._set_status(f"idle — saved {saved.name}")
-            ext = saved.suffix.lstrip(".") or self._default_ext_for_mode()
+            ext = saved.suffix.lstrip(".") or ext
+            if saved.exists() and saved.stat().st_size > 0:
+                self._set_status(f"idle — saved {saved.name}")
+            else:
+                self._set_status("idle — mux failed (see terminal)")
         elif exit_code == 0:
             self._set_status("idle — saved")
-            ext = self._default_ext_for_mode()
         else:
             self._set_status(f"idle — exited ({exit_code})")
-            ext = self._default_ext_for_mode()
 
         self.filename_entry.set_text(timestamped_filename("recording", ext))
+        app = self.get_application()
+        if app is not None and app.props.active_window is None:
+            app.quit()
         return GLib.SOURCE_REMOVE
 
 

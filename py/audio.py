@@ -20,6 +20,7 @@ import argparse
 import re
 import signal
 import subprocess
+from collections.abc import Callable
 from typing import Literal
 
 import gi
@@ -178,7 +179,7 @@ def build_wav_pipeline_string(settings: AudioSettings, system_sink: str) -> str:
 
 
 def build_aac_pipeline_string(settings: AudioSettings, system_sink: str) -> str:
-    """Mix mic + system monitor and write raw AAC (companion track for GNOME Shell video)."""
+    """Mix mic + system monitor and write raw AAC (legacy; prefer MP4 sidecar for postmux)."""
     quoted_path = escape_gst_string(settings.output_path)
     return (
         _mixer_head(settings)
@@ -274,6 +275,40 @@ class AudioRecorder:
         self.pipeline: Gst.Pipeline | None = None
         self.loop = GLib.MainLoop()
         self._stop_requested = False
+        self._on_finished_cb: Callable[[int], None] | None = None
+        self._exit_code = 0
+
+    def begin(self, on_finished: Callable[[int], None] | None = None) -> None:
+        """Start capture without blocking (requires a running GLib main loop)."""
+        self._on_finished_cb = on_finished
+        self._exit_code = 0
+        self._stop_requested = False
+        try:
+            self.pipeline = self._build_pipeline()
+        except Exception as exc:
+            log("audio", f"Pipeline build failed: {exc}")
+            self._complete(1)
+            return
+
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus_message)
+
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            log("audio", "Failed to set pipeline to PLAYING")
+            self._complete(1)
+            return
+
+        log("audio", f"Recording mic + system audio to: {self.settings.output_path}")
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._request_stop)
+
+    def _complete(self, code: int) -> None:
+        self._exit_code = code
+        cb = self._on_finished_cb
+        self._on_finished_cb = None
+        if cb:
+            cb(code)
 
     def _build_pipeline(self) -> Gst.Pipeline:
         pipeline_string = build_audio_pipeline_string(
@@ -314,7 +349,7 @@ class AudioRecorder:
         log("audio", "Press Ctrl+C to stop and finalize.")
         GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._request_stop)
         self.loop.run()
-        return 0
+        return self._exit_code
 
     def request_stop(self) -> None:
         """Send EOS to flush and finalize the output container."""
@@ -324,6 +359,8 @@ class AudioRecorder:
         log("audio", "Stopping; sending EOS...")
         if self.pipeline is not None:
             self.pipeline.send_event(Gst.Event.new_eos())
+        elif self._on_finished_cb:
+            self._complete(0)
         else:
             self.loop.quit()
 
@@ -331,18 +368,24 @@ class AudioRecorder:
         self.request_stop()
         return GLib.SOURCE_REMOVE
 
+    def _finish(self, exit_code: int) -> None:
+        self._cleanup()
+        if self._on_finished_cb:
+            self._complete(exit_code)
+        else:
+            self._exit_code = exit_code
+            self.loop.quit()
+
     def _on_bus_message(self, _bus: Gst.Bus, message: Gst.Message) -> None:
         if message.type == Gst.MessageType.EOS:
             log("audio", "EOS received. File finalized.")
-            self._cleanup()
-            self.loop.quit()
+            self._finish(0)
         elif message.type == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             log("audio", f"GStreamer error: {err}")
             if debug:
                 log("audio", f"Debug: {debug}")
-            self._cleanup()
-            self.loop.quit()
+            self._finish(1)
         elif message.type == Gst.MessageType.STATE_CHANGED and message.src == self.pipeline:
             _old, new, _pending = message.parse_state_changed()
             log("audio", f"Pipeline state -> {new.value_nick}")

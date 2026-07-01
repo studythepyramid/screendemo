@@ -33,6 +33,9 @@ from py.settings import (
     GNOME_SHELL_BUS,
     GNOME_SHELL_IFACE,
     GNOME_SHELL_PATH,
+    GNOME_SHELL_SCREENSHOT_BUS,
+    GNOME_SHELL_SCREENSHOT_IFACE,
+    GNOME_SHELL_SCREENSHOT_PATH,
     PERSIST_MODE_DO_NOT,
     PORTAL_BUS,
     PORTAL_PATH,
@@ -40,6 +43,7 @@ from py.settings import (
     PORTAL_REQUEST_TIMEOUT_SEC,
     PORTAL_RESPONSE_SUCCESS,
     PORTAL_SCREENCAST_IFACE,
+    PORTAL_SCREENSHOT_IFACE,
     PORTAL_SESSION_IFACE,
     SOURCE_MONITOR,
     SOURCE_WINDOW,
@@ -343,3 +347,132 @@ class GnomeShellScreencast:
             log("gnome-screencast", "Stopped.")
         except dbus.DBusException as exc:
             log("gnome-screencast", f"Stop failed: {exc}")
+
+
+class GnomeShellScreenshot:
+    """
+    Capture a single full-screen PNG via org.gnome.Shell.Screenshot.
+
+    May return AccessDenied for unprivileged callers; use PortalScreenshot as fallback.
+    """
+
+    def __init__(self, bus: dbus.SessionBus | None = None) -> None:
+        setup_dbus_mainloop()
+        self.bus = bus or connect_session_bus()
+        try:
+            shell_obj = self.bus.get_object(
+                GNOME_SHELL_SCREENSHOT_BUS, GNOME_SHELL_SCREENSHOT_PATH
+            )
+            self.screenshot = dbus.Interface(shell_obj, GNOME_SHELL_SCREENSHOT_IFACE)
+        except dbus.DBusException as exc:
+            raise RuntimeError(
+                f"Failed to connect to GNOME Shell Screenshot D-Bus API: {exc}"
+            ) from exc
+
+    def capture(
+        self,
+        output_path: str,
+        *,
+        include_cursor: bool = True,
+        flash: bool = False,
+    ) -> str:
+        """Write a PNG to ``output_path`` (absolute). Returns path GNOME used."""
+        success, filename_used = self.screenshot.Screenshot(
+            dbus.Boolean(include_cursor),
+            dbus.Boolean(flash),
+            output_path,
+        )
+        if not success:
+            raise RuntimeError("GNOME Shell Screenshot failed")
+        log("gnome-screenshot", f"Saved: {filename_used}")
+        return str(filename_used)
+
+
+class PortalScreenshot:
+    """
+    Capture the desktop via org.freedesktop.portal.Screenshot (async).
+
+    Calls ``on_success(file_uri)`` with a ``file://`` URI from the portal.
+    """
+
+    def __init__(
+        self,
+        on_success: Callable[[str], None],
+        *,
+        on_error: Callable[[str], None] | None = None,
+        request_timeout_sec: int = PORTAL_REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        setup_dbus_mainloop()
+        self.bus = connect_session_bus()
+        portal = self.bus.get_object(PORTAL_BUS, PORTAL_PATH)
+        self.screenshot = dbus.Interface(portal, PORTAL_SCREENSHOT_IFACE)
+
+        self.on_success = on_success
+        self.on_error = on_error or (lambda msg: log("error", msg))
+        self.request_timeout_sec = request_timeout_sec
+        self._request_path: str | None = None
+        self._timeout_id: int | None = None
+        self._response_match: int | None = None
+
+    def capture(
+        self,
+        parent_window: str = "",
+        *,
+        interactive: bool = False,
+    ) -> None:
+        """Start a portal screenshot (non-blocking; requires a running GLib loop)."""
+        token = new_token("snap")
+        options = dbus.Dictionary(
+            {
+                "handle_token": dbus.String(token),
+                "interactive": dbus.Boolean(interactive),
+            },
+            signature="sv",
+        )
+        log("portal-screenshot", "Requesting screenshot...")
+        try:
+            request_path = str(self.screenshot.Screenshot(parent_window, options))
+        except dbus.DBusException as exc:
+            self.on_error(f"portal Screenshot call failed: {exc}")
+            return
+
+        self._request_path = request_path
+        self._response_match = self.bus.add_signal_receiver(
+            self._on_response,
+            signal_name="Response",
+            dbus_interface=PORTAL_REQUEST_IFACE,
+            path=request_path,
+            bus_name=PORTAL_BUS,
+        )
+        self._timeout_id = GLib.timeout_add_seconds(
+            self.request_timeout_sec,
+            self._on_timeout,
+        )
+
+    def _cleanup(self) -> None:
+        if self._timeout_id is not None:
+            GLib.source_remove(self._timeout_id)
+            self._timeout_id = None
+        if self._response_match is not None:
+            self.bus.remove_signal_receiver(self._response_match)
+            self._response_match = None
+
+    def _on_timeout(self) -> bool:
+        self._cleanup()
+        self.on_error(
+            f"portal screenshot timeout after {self.request_timeout_sec}s"
+        )
+        return GLib.SOURCE_REMOVE
+
+    def _on_response(self, response, results) -> None:
+        self._cleanup()
+        code = int(response)
+        log("portal-screenshot", f"Response code={code} results={dict(results)!r}")
+        if code != PORTAL_RESPONSE_SUCCESS:
+            self.on_error(f"portal screenshot denied or cancelled (code={code})")
+            return
+        uri = results.get("uri")
+        if not uri:
+            self.on_error("portal screenshot returned no uri")
+            return
+        self.on_success(str(uri))

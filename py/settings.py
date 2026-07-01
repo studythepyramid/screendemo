@@ -29,6 +29,7 @@ def log(step: str, message: str) -> None:
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
 PORTAL_SCREENCAST_IFACE = "org.freedesktop.portal.ScreenCast"
+PORTAL_SCREENSHOT_IFACE = "org.freedesktop.portal.Screenshot"
 PORTAL_REQUEST_IFACE = "org.freedesktop.portal.Request"
 PORTAL_SESSION_IFACE = "org.freedesktop.portal.Session"
 
@@ -45,6 +46,10 @@ PORTAL_REQUEST_TIMEOUT_SEC = 60
 GNOME_SHELL_BUS = "org.gnome.Shell.Screencast"
 GNOME_SHELL_PATH = "/org/gnome/Shell/Screencast"
 GNOME_SHELL_IFACE = "org.gnome.Shell.Screencast"
+
+GNOME_SHELL_SCREENSHOT_BUS = "org.gnome.Shell.Screenshot"
+GNOME_SHELL_SCREENSHOT_PATH = "/org/gnome/Shell/Screenshot"
+GNOME_SHELL_SCREENSHOT_IFACE = "org.gnome.Shell.Screenshot"
 
 # --- Audio / PipeWire / GStreamer ---
 
@@ -94,11 +99,30 @@ def default_screen_mp4_path() -> str:
 
 
 def default_screen_mkv_path() -> str:
-    return timestamped_filename("gnome_sr", "mkv")
+    return timestamped_filename("recording", "mkv")
 
 
 def default_screen_webm_path() -> str:
     return timestamped_filename("screen", "webm")
+
+
+def default_snapshot_png_path() -> str:
+    return timestamped_filename("snapshot", "png")
+
+
+# --- Snapshot ---
+
+DELAY_FOR_ACTION = 1  # seconds before snapshot capture (time to hide UI)
+CROP_SNAPSHOT_LEFT = 82
+CROP_SNAPSHOT_TOP = 70
+CROP_SNAPSHOT_RIGHT = 0
+CROP_SNAPSHOT_BOTTOM = 0
+SNAPSHOT_DRAW_COMMAND = "drawing"
+OPEN_SNAPSHOT_IN_DRAWING = True
+DRAWING_APP_ID = "com.github.maoschanz.drawing"
+DRAWING_WINDOW_ACTION_PATH = "/com/github/maoschanz/drawing/window/1"
+DRAWING_START_FULLSCREEN = True
+DRAWING_FULLSCREEN_TIMEOUT_SEC = 5
 
 
 # --- Screen recording ---
@@ -111,7 +135,7 @@ DEFAULT_RECORDING_MODE = RECORDING_MODE_GNOME
 
 @dataclass
 class ScreenRecordingSettings:
-    """Desktop screen capture parameters (video only for now)."""
+    """Desktop screen capture parameters."""
 
     output_path: str
     mode: str = DEFAULT_RECORDING_MODE
@@ -132,6 +156,31 @@ class ScreenRecordingSettings:
                 raise ValueError("Portal mode requires output ending with .mp4")
         else:
             raise ValueError(f"Unknown recording mode: {self.mode}")
+
+
+@dataclass
+class AvRecordingSettings(ScreenRecordingSettings):
+    """Screen capture with mic + system audio."""
+
+    system_sink: str | None = None
+    mic_volume: float = DEFAULT_MIC_VOLUME
+    system_volume: float = DEFAULT_SYSTEM_VOLUME
+    audio_bitrate: int = DEFAULT_AUDIO_BITRATE
+    mic_capture_backend: str = DEFAULT_MIC_CAPTURE_BACKEND
+    system_capture_backend: str = DEFAULT_SYSTEM_CAPTURE_BACKEND
+
+    def validate(self) -> None:
+        super().validate()
+        if self.mic_volume <= 0:
+            raise ValueError("mic_volume must be > 0")
+        if self.system_volume <= 0:
+            raise ValueError("system_volume must be > 0")
+        if self.audio_bitrate < MIN_AUDIO_BITRATE:
+            raise ValueError(f"audio_bitrate must be >= {MIN_AUDIO_BITRATE}")
+        if self.mode == RECORDING_MODE_GNOME and self.output_path.endswith(".mp4"):
+            raise ValueError(
+                "GNOME Shell A+V use .mkv or .webm output (post-mux, no re-encode)"
+            )
 
 
 @dataclass

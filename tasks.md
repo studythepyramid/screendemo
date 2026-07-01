@@ -1,3 +1,93 @@
+# July 01
+
+## 0754am
+
+test the gnome shell path
+UI status show Mic. Sys Audio, freedesktop portal, etc.
+UI buttons to turn on/off Mic and system audio
+
+
+# june 30
+
+## chop off system dock and tray
+
+Yes — **ImageMagick can do this well**. It’s a good fit for one-off CLI crops and for scripting after `snapshot.py` saves a PNG.
+
+## Left dock: remove 32 px
+
+**ImageMagick 7** (Ubuntu default):
+
+```bash
+magick input.png -gravity West -chop 32x0 output.png
+```
+
+That chops 32 pixels off the **left** edge and keeps the rest.
+
+Equivalent with explicit crop (if image is 1920×1080):
+
+```bash
+magick input.png -crop 1888x1080+32+0 +repage output.png
+```
+
+(`width = total_width - 32`, start at `x=32`, `y=0`.)
+
+**Older `convert` syntax** (same idea):
+
+```bash
+convert input.png -gravity West -chop 32x0 output.png
+```
+
+## Top bar / system tray area
+
+On GNOME the tray is usually in the **top** bar, not the bottom. To remove ~32 px from the top:
+
+```bash
+magick input.png -gravity North -chop 0x32 output.png
+```
+
+## Both left dock and top bar
+
+Order matters: chop left first, then top:
+
+```bash
+magick input.png \
+  -gravity West -chop 32x0 \
+  -gravity North -chop 0x32 \
+  output.png
+```
+
+Adjust `32` if your bar is taller (often 34–48 px at 100% scale).
+
+## HiDPI note
+
+If display scaling is **200%**, the dock may be **64 physical pixels** wide even if it looks like “32” in GNOME settings. Check one screenshot:
+
+```bash
+magick input.png -format "%wx%h" info:
+```
+
+Then inspect in an image viewer where the dock ends.
+
+## Other tools (if you prefer)
+
+| Tool | Left 32 px crop |
+|------|------------------|
+| **ffmpeg** | `ffmpeg -i in.png -vf "crop=iw-32:ih:32:0" out.png` |
+| **Pillow (Python)** | `img.crop((32, 0, width, height))` — fits screendemo later |
+
+## Practical workflow for you
+
+```bash
+uv run py/snapshot.py -o tmp/snap.png
+magick tmp/snap.png -gravity West -chop 32x0 -gravity North -chop 0x32 tmp/snap-cropped.png
+```
+
+## Integration idea (later)
+
+Add optional crop insets in `settings.py`, e.g. `SNAPSHOT_CROP_LEFT=32`, `SNAPSHOT_CROP_TOP=32`, and run ImageMagick or Pillow after capture. That keeps the UI delay + hide-window flow you already have.
+
+If you want this wired into `snapshot.py` or the UI, switch to Agent mode and we can add it.
+
 
 # June 27
 
@@ -82,5 +172,3 @@ screen_recording.py
 camera.py
 ui.py
 Say when to proceed with audio.py.
-
-

@@ -1,10 +1,10 @@
 """
 Screen recording on GNOME Wayland via PipeWire + GStreamer.
 
-Two capture paths (video only for now; audio deferred to audio.py / sink2mp4.py):
+Capture paths:
 
-1. **portal** — XDG Desktop Portal dialog, encodes to MP4 (maskai/py/sr1.py)
-2. **gnome** — org.gnome.Shell.Screencast, writes WebM directly (maskai/py/gnome_sr.py)
+1. **portal** — XDG Desktop Portal → MP4 (video-only in this module; A+V in xdgav.py)
+2. **gnome** — org.gnome.Shell.Screencast → WebM/MKV (video-only or A+V via GnomeShellAvRecorder + postmux.py)
 """
 
 from __future__ import annotations
@@ -20,7 +20,12 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 import argparse
+import os
+import random
+import signal
+import sys
 import threading
+from collections.abc import Callable
 
 import dbus
 import gi
@@ -31,14 +36,19 @@ gi.require_version("GLibUnix", "2.0")
 from gi.repository import GLib, GLibUnix, Gst
 
 from py.audio import escape_gst_string
+from py.audio import AudioRecorder, AudioSettings
 from py.dbus_permissions import GnomeShellScreencast, PortalScreenCastSession, setup_dbus_mainloop
+from py.postmux import cleanup_temp_files, mux_av_files
 from py.settings import (
+    AUDIO_EOS_FINALIZE_TIMEOUT_SEC,
     DEFAULT_RECORDING_MODE,
     RECORDING_MODE_GNOME,
     RECORDING_MODE_PORTAL,
     SCREEN_EOS_FINALIZE_TIMEOUT_SEC,
+    AvRecordingSettings,
     ScreenRecordingSettings,
     default_screen_mp4_path,
+    default_screen_mkv_path,
     default_screen_webm_path,
     log,
 )
@@ -342,10 +352,190 @@ class GnomeShellScreenRecorder:
         return GLib.SOURCE_REMOVE
 
 
+class GnomeShellAvRecorder:
+    """
+    GNOME Shell screencast (video file) + parallel AAC audio → post-mux to MKV/WebM.
+    """
+
+    def __init__(self, settings: AvRecordingSettings) -> None:
+        settings.validate()
+        self.settings = settings
+        self.output_path = os.path.abspath(settings.output_path)
+        self.shell = GnomeShellScreencast()
+        self._audio_recorder: AudioRecorder | None = None
+        self._stop_requested = False
+        self._on_finished_cb: Callable[[int], None] | None = None
+        self._exit_code = 0
+        self._mux_started = False
+        self._finalize_timeout_id: int | None = None
+
+        output_dir = os.path.dirname(self.output_path)
+        rand_id = f"{random.randint(0, 0xFFFFFF):06x}"
+        self.temp_video_path = os.path.join(output_dir, f".temp_video_{rand_id}.webm")
+        self.temp_audio_path = os.path.join(output_dir, f".temp_audio_{rand_id}.m4a")
+        self.video_path = self.temp_video_path
+
+    def begin(self, on_finished: Callable[[int], None] | None = None) -> None:
+        self._on_finished_cb = on_finished
+        self._exit_code = 0
+        self._stop_requested = False
+        self._mux_started = False
+        log("main", f"Output file: {self.output_path}")
+
+        audio_settings = AudioSettings(
+            output_path=self.temp_audio_path,
+            system_sink=self.settings.system_sink,
+            mic_volume=self.settings.mic_volume,
+            system_volume=self.settings.system_volume,
+            audio_bitrate=self.settings.audio_bitrate,
+            mic_capture_backend=self.settings.mic_capture_backend,
+            system_capture_backend=self.settings.system_capture_backend,
+        )
+        try:
+            self._audio_recorder = AudioRecorder(audio_settings, container="mp4")
+            self._audio_recorder.begin(on_finished=self._on_audio_finished)
+        except RuntimeError as exc:
+            print(f"Audio error: {exc}", file=sys.stderr)
+            self._complete(1)
+            return
+
+        try:
+            actual = self.shell.start(self.temp_video_path, draw_cursor=self.settings.draw_cursor)
+            self.video_path = os.path.abspath(actual)
+        except RuntimeError as exc:
+            print(f"GNOME Screencast error: {exc}", file=sys.stderr)
+            if self._audio_recorder is not None:
+                self._audio_recorder.request_stop()
+            self._complete(1)
+            return
+
+        log("record", f"GNOME video → {self.video_path}")
+        log("record", f"Audio sidecar → {self.temp_audio_path}")
+        log("record", "Recording A/V started.")
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._request_stop)
+
+    def request_stop(self) -> None:
+        if self._stop_requested:
+            return
+        self._stop_requested = True
+        log("record", "Stopping GNOME Shell screencast and audio...")
+        try:
+            self.shell.stop()
+            log("gnome-screencast", "Stopped.")
+        except RuntimeError as exc:
+            log("error", str(exc))
+        if self._audio_recorder is not None:
+            self._audio_recorder.request_stop()
+        self._arm_finalize_timeout()
+
+    def _arm_finalize_timeout(self) -> None:
+        if self._finalize_timeout_id is not None:
+            GLib.source_remove(self._finalize_timeout_id)
+        self._finalize_timeout_id = GLib.timeout_add_seconds(
+            AUDIO_EOS_FINALIZE_TIMEOUT_SEC + 10,
+            self._on_finalize_timeout,
+        )
+
+    def _clear_finalize_timeout(self) -> None:
+        if self._finalize_timeout_id is not None:
+            GLib.source_remove(self._finalize_timeout_id)
+            self._finalize_timeout_id = None
+
+    def _on_finalize_timeout(self) -> bool:
+        self._finalize_timeout_id = None
+        if self._mux_started:
+            return GLib.SOURCE_REMOVE
+        log("error", "Recording finalize timeout")
+        try:
+            self.shell.stop()
+        except RuntimeError:
+            pass
+        cleanup_temp_files(self.temp_audio_path, self.video_path)
+        self._complete(1)
+        return GLib.SOURCE_REMOVE
+
+    def start(self) -> int:
+        loop = GLib.MainLoop()
+
+        def done(_code: int) -> None:
+            loop.quit()
+
+        self.begin(on_finished=done)
+        loop.run()
+        return self._exit_code
+
+    def _on_audio_finished(self, exit_code: int) -> None:
+        if not self._stop_requested:
+            if exit_code != 0:
+                log("error", "Audio capture failed during recording")
+                try:
+                    self.shell.stop()
+                except RuntimeError:
+                    pass
+                cleanup_temp_files(self.temp_audio_path, self.video_path)
+                self._complete(1)
+            return
+        if self._mux_started:
+            return
+        self._mux_started = True
+        self._clear_finalize_timeout()
+
+        if exit_code != 0:
+            cleanup_temp_files(self.temp_audio_path, self.video_path)
+            self._complete(1)
+            return
+
+        video = self.video_path
+        audio = self.temp_audio_path
+        output = self.output_path
+
+        def worker() -> None:
+            code = 0
+            try:
+                if os.path.exists(video) and os.path.exists(audio):
+                    mux_av_files(video, audio, output)
+                    log("record", f"Saved: {output}")
+                else:
+                    log("error", "Temporary video or audio file missing")
+                    code = 1
+            except (RuntimeError, OSError) as exc:
+                log("error", f"Post-mux failed: {exc}")
+                code = 1
+            finally:
+                if code != 0 and os.path.exists(output) and os.path.getsize(output) == 0:
+                    try:
+                        os.unlink(output)
+                    except OSError:
+                        pass
+                cleanup_temp_files(audio, video)
+            GLib.idle_add(lambda: (self._complete(code), False)[-1])
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _request_stop(self) -> bool:
+        self.request_stop()
+        return GLib.SOURCE_REMOVE
+
+    def _complete(self, code: int) -> None:
+        self._exit_code = code
+        cb = self._on_finished_cb
+        self._on_finished_cb = None
+        if cb:
+            cb(code)
+
+
 def run_screen_recording(settings: ScreenRecordingSettings) -> int:
     if settings.mode == RECORDING_MODE_GNOME:
         return GnomeShellScreenRecorder(settings).start()
     return PortalScreenRecorder(settings).start()
+
+
+def run_av_recording(settings: AvRecordingSettings) -> int:
+    if settings.mode == RECORDING_MODE_GNOME:
+        return GnomeShellAvRecorder(settings).start()
+    from py.xdgav import PortalAvRecorder
+
+    return PortalAvRecorder(settings).start()
 
 
 def main() -> int:
